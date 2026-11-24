@@ -77,6 +77,9 @@ pub enum BatchRouterError {
     /// `simulate_batch` and `validate_batch` alike so the pre-flight never
     /// disagrees with execution.
     Paused = 15,
+    /// The AMM pool has been permanently drained via emergency withdrawal.
+    /// Surfaced by simulation so pre-flight does not quote untradeable pools.
+    PoolDrained = 16,
 }
 
 #[contracttype]
@@ -364,6 +367,10 @@ impl BatchRouter {
     /// be replayed locally, so a second CL op on a pool an earlier op in the
     /// same batch already touched returns
     /// [`BatchRouterError::UnsimulatableChain`] rather than a stale quote.
+    ///
+    /// AMM circuit-breaker and oracle-deviation checks are intentionally not
+    /// replayed here yet; swaps that would return `Ok(0)`/revert for those
+    /// guards can still receive a quote from `simulate_batch`.
     pub fn simulate_batch(
         env: Env,
         ops: Vec<BatchOp>,
@@ -656,8 +663,12 @@ impl BatchRouter {
         pools: &mut Vec<SimPoolState>,
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
-        if AmmPoolClient::new(env, &o.pool).is_paused() {
+        let amm = AmmPoolClient::new(env, &o.pool);
+        if amm.is_paused() {
             return Err(BatchRouterError::PoolPaused);
+        }
+        if amm.is_drained() {
+            return Err(BatchRouterError::PoolDrained);
         }
         let (reserve_in, reserve_out, in_is_a) = if o.token_in == state.token_a {
             (state.reserve_a, state.reserve_b, true)
@@ -667,7 +678,7 @@ impl BatchRouter {
             return Err(BatchRouterError::InvalidAmount);
         };
         if reserve_in <= 0 || reserve_out <= 0 {
-            return Err(BatchRouterError::PoolNotFound);
+            return Err(BatchRouterError::PoolDrained);
         }
         // Mirrors amm::swap (contracts/amm/src/lib.rs:2075-2078).
         let amount_in_with_fee = o.amount_in * (10_000 - state.fee_bps);
@@ -736,8 +747,12 @@ impl BatchRouter {
         pools: &mut Vec<SimPoolState>,
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
-        if AmmPoolClient::new(env, &o.pool).is_paused() {
+        let amm = AmmPoolClient::new(env, &o.pool);
+        if amm.is_paused() {
             return Err(BatchRouterError::PoolPaused);
+        }
+        if amm.is_drained() {
+            return Err(BatchRouterError::PoolDrained);
         }
         // Mirrors amm::add_liquidity share math (contracts/amm/src/lib.rs:1610-1618).
         let shares = if state.total_shares == 0 {
@@ -779,8 +794,12 @@ impl BatchRouter {
         pools: &mut Vec<SimPoolState>,
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
-        if AmmPoolClient::new(env, &o.pool).is_paused() {
+        let amm = AmmPoolClient::new(env, &o.pool);
+        if amm.is_paused() {
             return Err(BatchRouterError::PoolPaused);
+        }
+        if amm.is_drained() {
+            return Err(BatchRouterError::PoolDrained);
         }
         if state.total_shares == 0 {
             return Err(BatchRouterError::InvalidAmount);
@@ -1438,6 +1457,18 @@ mod tests {
         })
     }
 
+    fn drain_pool(env: &Env, pool: &Address) {
+        let amm = AmmContractClient::new(env, pool);
+        let admin = amm.get_info().admin;
+        let recipient = Address::generate(env);
+        amm.pause();
+        amm.announce_emergency_withdraw(&admin, &recipient);
+        let ready_at = env.ledger().timestamp() + amm.get_emergency_delay();
+        env.ledger().set_timestamp(ready_at);
+        amm.emergency_withdraw(&admin, &recipient);
+        assert!(amm.is_drained());
+    }
+
     /// The core #1043 invariant: simulation and execution agree exactly.
     fn assert_sim_matches_execute(
         env: &Env,
@@ -1768,6 +1799,78 @@ mod tests {
         assert_eq!(
             client.try_validate_batch(&ops, &deadline),
             Err(Ok(BatchRouterError::PoolPaused))
+        );
+    }
+
+    #[test]
+    fn test_simulate_batch_rejects_drained_amm_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (ta, tb, pool, trader) = setup_pool(&env, &factory_addr);
+        fund(&env, &ta, &trader, 100_000);
+        fund(&env, &tb, &trader, 100_000);
+        drain_pool(&env, &pool);
+
+        let client = deploy_router(&env, &factory_addr);
+        let ops = vec![&env, swap_op(&pool, &ta, 10_000, PoolType::Amm, false)];
+        assert_eq!(
+            client.try_simulate_batch(&ops),
+            Err(Ok(BatchRouterError::PoolDrained))
+        );
+    }
+
+    #[test]
+    fn test_validate_batch_rejects_drained_amm_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (ta, tb, pool, trader) = setup_pool(&env, &factory_addr);
+        fund(&env, &ta, &trader, 100_000);
+        fund(&env, &tb, &trader, 100_000);
+        drain_pool(&env, &pool);
+
+        let client = deploy_router(&env, &factory_addr);
+        let ops = vec![&env, swap_op(&pool, &ta, 10_000, PoolType::Amm, false)];
+        let deadline = env.ledger().timestamp() + 1_000;
+        assert_eq!(
+            client.try_validate_batch(&ops, &deadline),
+            Err(Ok(BatchRouterError::PoolDrained))
+        );
+        assert!(client.try_execute_batch(&trader, &ops, &deadline).is_err());
+    }
+
+    #[test]
+    fn test_simulate_batch_rejects_drained_add_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (ta, tb, pool, provider) = setup_pool(&env, &factory_addr);
+        fund(&env, &ta, &provider, 100_000);
+        fund(&env, &tb, &provider, 100_000);
+        drain_pool(&env, &pool);
+
+        let client = deploy_router(&env, &factory_addr);
+        let ops = vec![&env, add_op(&pool, 10_000, 10_000, 0)];
+        assert_eq!(
+            client.try_simulate_batch(&ops),
+            Err(Ok(BatchRouterError::PoolDrained))
+        );
+    }
+
+    #[test]
+    fn test_simulate_batch_rejects_drained_remove_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (_, _, pool, _) = setup_pool(&env, &factory_addr);
+        drain_pool(&env, &pool);
+
+        let client = deploy_router(&env, &factory_addr);
+        let ops = vec![&env, remove_op(&pool, 100_000)];
+        assert_eq!(
+            client.try_simulate_batch(&ops),
+            Err(Ok(BatchRouterError::PoolDrained))
         );
     }
 

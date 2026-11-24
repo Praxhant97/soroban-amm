@@ -184,6 +184,9 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 13 | `Unauthorized` | The address supplied as admin to `pause`/`unpause`/`propose_admin`/`upgrade` is not the stored admin, or `accept_admin` was called with an address other than the pending nominee. | Pass the current admin (or the nominee) and sign as that address. |
 | 14 | `NoPendingAdmin` | `accept_admin` called while no `propose_admin` nomination is pending. | Have the admin call `propose_admin` first. |
 | 15 | `Paused` | The router is paused by its admin; returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Wait for the admin to call `unpause`. |
+| 16 | `PoolDrained` | The target AMM pool is in terminal drained state (or has empty reserves in simulation), so swap/liquidity simulation refuses to quote it. | Treat the pool as retired; route to a different pool. |
+
+Current simulation note: `batch_router::simulate_batch` still does not replay AMM circuit-breaker and oracle-deviation checks, so those AMM guards can still diverge between simulation and execution.
 
 ---
 
